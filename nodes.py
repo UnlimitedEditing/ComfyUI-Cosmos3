@@ -173,12 +173,31 @@ class Cosmos3ModelLoader:
 
             source = model_dir
 
-        # Use the class directly — no diffusers module patching required
-        pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
-            source,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",      # Cosmos3OmniDiffusersPipeline supports: balanced, cuda, cpu
-        )
+        # ── adaptive VRAM strategy ────────────────────────────────────────────
+        # 16B model @ bfloat16 ≈ 32 GB weights.  Need headroom for activations.
+        # Threshold: 40 GB — comfortably covers 6000 Ada (48 GB) but not 5090 (32 GB).
+        _HIGH_VRAM_GB = 40.0
+        _total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"[Cosmos3] GPU: {torch.cuda.get_device_name(0)} ({_total_vram_gb:.0f} GB)")
+
+        if _total_vram_gb >= _HIGH_VRAM_GB:
+            print("[Cosmos3] High-VRAM mode — device_map='balanced'")
+            pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
+                source,
+                torch_dtype=torch.bfloat16,
+                device_map="balanced",
+            )
+        else:
+            print(f"[Cosmos3] Low-VRAM mode ({_total_vram_gb:.0f} GB) — "
+                  "loading to CPU then enabling sequential offload (slower but fits)")
+            pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
+                source,
+                torch_dtype=torch.bfloat16,
+                # no device_map → loads to CPU
+            )
+            pipe.enable_sequential_cpu_offload()
+        # ─────────────────────────────────────────────────────────────────────
+
         print("[Cosmos3] Pipeline loaded.")
         return (pipe,)
 
