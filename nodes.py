@@ -255,6 +255,8 @@ class Cosmos3T2ISampler:
         custom_width=1280,
         custom_height=720,
     ):
+        import inspect
+
         if resolution == "custom":
             w, h = custom_width, custom_height
         else:
@@ -266,21 +268,33 @@ class Cosmos3T2ISampler:
 
         generator = torch.Generator(device=mm.get_torch_device()).manual_seed(seed)
 
+        # Base kwargs — always supported by Cosmos3OmniDiffusersPipeline
         kwargs = dict(
             prompt=prompt,
             width=w,
             height=h,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
+            num_frames=1,               # T2I = single frame
             generator=generator,
         )
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
-        print(f"[Cosmos3 T2I] Generating {w}x{h} | steps={num_inference_steps} cfg={guidance_scale} seed={seed}")
+        # Conditionally pass params that may not exist in all pipeline versions
+        sig = inspect.signature(pipeline.__call__)
+        if "num_inference_steps" in sig.parameters:
+            kwargs["num_inference_steps"] = num_inference_steps
+        if "guidance_scale" in sig.parameters:
+            kwargs["guidance_scale"] = guidance_scale
+
+        print(f"[Cosmos3 T2I] Generating {w}x{h} | seed={seed} (steps/cfg passed if supported)")
         result = pipeline(**kwargs)
 
-        image_tensor = pil2tensor(result.images[0])
+        # Cosmos3OmniDiffusersPipeline returns list[Tensor[C, T, H, W]] in [0, 1]
+        raw = result[0]
+        if raw.ndim == 4:
+            raw = raw[:, 0, :, :]   # [C, 1, H, W] → [C, H, W]
+        # raw is [C, H, W], convert to ComfyUI [1, H, W, C] float32
+        image_tensor = raw.float().clamp(0.0, 1.0).permute(1, 2, 0).unsqueeze(0)
         return (image_tensor,)
 
 
