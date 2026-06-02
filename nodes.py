@@ -83,32 +83,25 @@ class Cosmos3ModelLoader:
     CATEGORY = "Cosmos3"
 
     def load(self, model, custom_path=""):
+        # ── import cosmos3 plugins ────────────────────────────────────────────
         try:
-            from diffusers import DiffusionPipeline
-        except ImportError:
-            raise ImportError(
-                "[Cosmos3] diffusers not found. "
-                "Install with: pip install git+https://github.com/huggingface/diffusers.git"
-            )
-        try:
-            import transformers_cosmos3  # noqa: F401 — requires transformers>=4.57, registers Cosmos3OmniConfig
+            import transformers_cosmos3  # noqa: F401 — requires transformers>=4.57
         except ImportError:
             raise ImportError(
                 "[Cosmos3] transformers-cosmos3 not found. "
-                "Install with: pip install 'transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3'"
+                "Install: pip install 'transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3'"
             )
         try:
-            import diffusers_cosmos3  # noqa: F401 — patches diffusers with Cosmos3OmniDiffusersPipeline
+            from diffusers_cosmos3 import Cosmos3OmniDiffusersPipeline
         except ImportError:
             raise ImportError(
                 "[Cosmos3] diffusers-cosmos3 not found. "
-                "Install with: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
+                "Install: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
             )
 
-        # ── RoPE 'default' patch ───────────────────────────────────────────────
-        # transformers<4.57 may not register 'default' in ROPE_INIT_FUNCTIONS even
-        # though the dict itself exists.  Patch in-place before from_pretrained
-        # instantiates the transformer (safe: same dict object).
+        # ── RoPE 'default' patch ──────────────────────────────────────────────
+        # transformers<4.57 may ship ROPE_INIT_FUNCTIONS without a 'default' key.
+        # Patch the dict in-place before from_pretrained instantiates the transformer.
         try:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
             if "default" not in ROPE_INIT_FUNCTIONS:
@@ -117,7 +110,6 @@ class Cosmos3ModelLoader:
                     ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
                     print("[Cosmos3] Patched ROPE_INIT_FUNCTIONS['default'] from transformers internals")
                 except ImportError:
-                    # Minimal fallback: standard inv-freq RoPE, no scaling
                     def _cosmos3_default_rope(config, device=None, seq_len=None, **kwargs):
                         base = getattr(config, "rope_theta", 10000.0)
                         head_dim = getattr(config, "head_dim",
@@ -132,7 +124,7 @@ class Cosmos3ModelLoader:
                     print("[Cosmos3] Patched ROPE_INIT_FUNCTIONS['default'] with fallback implementation")
         except Exception as rope_err:
             print(f"[Cosmos3] Warning: could not patch ROPE_INIT_FUNCTIONS: {rope_err}")
-        # ──────────────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────────────
 
         from huggingface_hub import snapshot_download
 
@@ -158,10 +150,11 @@ class Cosmos3ModelLoader:
 
             source = model_dir
 
-        pipe = DiffusionPipeline.from_pretrained(
+        # Use the class directly — no diffusers module patching required
+        pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
             source,
             torch_dtype=torch.bfloat16,
-            device_map="balanced",      # Cosmos3OmniPipeline supports: balanced, cuda, cpu
+            device_map="balanced",      # Cosmos3OmniDiffusersPipeline supports: balanced, cuda, cpu
         )
         print("[Cosmos3] Pipeline loaded.")
         return (pipe,)
