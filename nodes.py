@@ -91,6 +91,13 @@ class Cosmos3ModelLoader:
                 "Install with: pip install git+https://github.com/huggingface/diffusers.git"
             )
         try:
+            import transformers_cosmos3  # noqa: F401 — requires transformers>=4.57, registers Cosmos3OmniConfig
+        except ImportError:
+            raise ImportError(
+                "[Cosmos3] transformers-cosmos3 not found. "
+                "Install with: pip install 'transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3'"
+            )
+        try:
             import diffusers_cosmos3  # noqa: F401 — patches diffusers with Cosmos3OmniDiffusersPipeline
         except ImportError:
             raise ImportError(
