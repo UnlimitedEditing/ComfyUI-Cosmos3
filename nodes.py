@@ -117,7 +117,7 @@ class Cosmos3ModelLoader:
         pipe = DiffusionPipeline.from_pretrained(
             source,
             torch_dtype=torch.bfloat16,
-            device_map="auto",          # lets accelerate handle CPU offload if VRAM is tight
+            device_map="balanced",      # Cosmos3OmniPipeline supports: balanced, cuda, cpu
         )
         print("[Cosmos3] Pipeline loaded.")
         return (pipe,)
