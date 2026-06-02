@@ -1,0 +1,15 @@
+# Cosmos3-Nano ComfyUI custom nodes
+#
+# IMPORTANT: diffusers must be installed from git HEAD — Cosmos3OmniPipeline
+# is not in a stable release yet.
+#
+#   pip install git+https://github.com/huggingface/diffusers.git
+#
+# If ComfyUI manages its own venv, run that pip install inside it.
+
+diffusers @ git+https://github.com/huggingface/diffusers.git
+accelerate>=0.27.0
+transformers>=4.40.0
+huggingface_hub>=0.23.0
+sentencepiece
+av
