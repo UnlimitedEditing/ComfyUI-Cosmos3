@@ -104,6 +104,36 @@ class Cosmos3ModelLoader:
                 "[Cosmos3] diffusers-cosmos3 not found. "
                 "Install with: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
             )
+
+        # ── RoPE 'default' patch ───────────────────────────────────────────────
+        # transformers<4.57 may not register 'default' in ROPE_INIT_FUNCTIONS even
+        # though the dict itself exists.  Patch in-place before from_pretrained
+        # instantiates the transformer (safe: same dict object).
+        try:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            if "default" not in ROPE_INIT_FUNCTIONS:
+                try:
+                    from transformers.modeling_rope_utils import _compute_default_rope_parameters
+                    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+                    print("[Cosmos3] Patched ROPE_INIT_FUNCTIONS['default'] from transformers internals")
+                except ImportError:
+                    # Minimal fallback: standard inv-freq RoPE, no scaling
+                    def _cosmos3_default_rope(config, device=None, seq_len=None, **kwargs):
+                        base = getattr(config, "rope_theta", 10000.0)
+                        head_dim = getattr(config, "head_dim",
+                            getattr(config, "hidden_size", 4096) //
+                            getattr(config, "num_attention_heads", 32))
+                        dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+                        inv_freq = 1.0 / (base ** (
+                            torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
+                        ))
+                        return inv_freq, 1.0
+                    ROPE_INIT_FUNCTIONS["default"] = _cosmos3_default_rope
+                    print("[Cosmos3] Patched ROPE_INIT_FUNCTIONS['default'] with fallback implementation")
+        except Exception as rope_err:
+            print(f"[Cosmos3] Warning: could not patch ROPE_INIT_FUNCTIONS: {rope_err}")
+        # ──────────────────────────────────────────────────────────────────────
+
         from huggingface_hub import snapshot_download
 
         if model == "custom":
