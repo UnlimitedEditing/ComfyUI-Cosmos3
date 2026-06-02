@@ -1,4 +1,6 @@
+import json
 import os
+import pathlib
 import numpy as np
 import torch
 from PIL import Image
@@ -93,11 +95,32 @@ class Cosmos3ModelLoader:
             )
         try:
             from diffusers_cosmos3 import Cosmos3OmniDiffusersPipeline
+            import diffusers_cosmos3 as _dc3_pkg
         except ImportError:
             raise ImportError(
                 "[Cosmos3] diffusers-cosmos3 not found. "
                 "Install: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
             )
+
+        # ── sample_args patch ────────────────────────────────────────────────
+        # The sample_args/*.json files that Cosmos3OmniDiffusersPipeline reads at
+        # inference time may not be included in the pip install (packaging gap in
+        # cosmos-framework as of June 2026).  Create them with correct defaults
+        # from the README if they're missing.
+        _sample_args_dir = pathlib.Path(_dc3_pkg.__file__).parent / "sample_args"
+        _sample_args_dir.mkdir(exist_ok=True)
+        _mode_defaults = {
+            "text2video":  {"guidance": 6.0, "num_steps": 35, "shift": 10.0,
+                            "negative_prompt": "", "negative_prompt_keep_metadata": False},
+            "image2video": {"guidance": 6.0, "num_steps": 35, "shift": 10.0,
+                            "negative_prompt": "", "negative_prompt_keep_metadata": False},
+        }
+        for _mode, _defs in _mode_defaults.items():
+            _p = _sample_args_dir / f"{_mode}.json"
+            if not _p.exists():
+                _p.write_text(json.dumps(_defs, indent=2))
+                print(f"[Cosmos3] Created missing sample_args/{_mode}.json")
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── RoPE 'default' patch ──────────────────────────────────────────────
         # transformers<4.57 may ship ROPE_INIT_FUNCTIONS without a 'default' key.
