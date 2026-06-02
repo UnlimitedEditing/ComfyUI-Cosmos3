@@ -90,6 +90,13 @@ class Cosmos3ModelLoader:
                 "[Cosmos3] diffusers not found. "
                 "Install with: pip install git+https://github.com/huggingface/diffusers.git"
             )
+        try:
+            import diffusers_cosmos3  # noqa: F401 — patches diffusers with Cosmos3OmniDiffusersPipeline
+        except ImportError:
+            raise ImportError(
+                "[Cosmos3] diffusers-cosmos3 not found. "
+                "Install with: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
+            )
         from huggingface_hub import snapshot_download
 
         if model == "custom":

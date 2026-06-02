@@ -1,13 +1,14 @@
 # Cosmos3-Nano ComfyUI custom nodes
 #
-# IMPORTANT: diffusers must be installed from git HEAD — Cosmos3OmniPipeline
-# is not in a stable release yet.
+# diffusers-cosmos3 is an NVIDIA plugin that patches diffusers at import time
+# to register Cosmos3OmniDiffusersPipeline and Cosmos3OmniTransformer.
+# It must be installed AND imported before DiffusionPipeline.from_pretrained.
 #
+# diffusers>=0.37.0 is required. Install from git HEAD if 0.37 is not on PyPI yet:
 #   pip install git+https://github.com/huggingface/diffusers.git
-#
-# If ComfyUI manages its own venv, run that pip install inside it.
 
 diffusers @ git+https://github.com/huggingface/diffusers.git
+diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3
 accelerate>=0.27.0
 transformers>=4.40.0
 huggingface_hub>=0.23.0
