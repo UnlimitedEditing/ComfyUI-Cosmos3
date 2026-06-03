@@ -605,12 +605,146 @@ class Cosmos3LoadImageFromURL:
         return (pil2tensor(pil_image),)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Cosmos3T2VSampler:
+    """
+    Cosmos3-Nano Text-to-Video sampler.
+
+    Outputs the first frame as a ComfyUI IMAGE (for preview + Graydient capture)
+    and saves the full video as MP4 to the output directory.
+
+    num_frames tips:
+      • Stick to 4k+1 values (5, 9, 17, 33, 65, 129, 189) for clean temporal compression.
+      • Start with 33 frames (~1.4 s) to test memory; scale up from there.
+      • 189 frames (full 8 s) will likely OOM on GPUs < 48 GB even with INT4.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline":            ("COSMOS3_PIPELINE",),
+                "prompt":              ("STRING", {"multiline": True, "forceInput": True}),
+                "num_frames":          ("INT",   {"default": 33,  "min": 5,   "max": 189, "step": 4,
+                                                  "tooltip": "5/9/17/33/65/129/189 — use 4k+1 values"}),
+                "resolution":          (list(RESOLUTIONS.keys()), {"default": "1280x720 (16:9 HD)"}),
+                "fps":                 ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0}),
+                "num_inference_steps": ("INT",   {"default": 10,  "min": 1,   "max": 100, "step": 1}),
+                "guidance_scale":      ("FLOAT", {"default": 6.0, "min": 0.0, "max": 20.0, "step": 0.5}),
+                "seed":                ("INT",   {"default": 0,   "min": 0,   "max": 0xFFFFFFFFFFFFFFFF}),
+                "filename_prefix":     ("STRING", {"default": "cosmos3/t2v"}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "forceInput": True}),
+                "custom_width":    ("INT",    {"default": 1280, "min": 256, "max": 2048, "step": 16}),
+                "custom_height":   ("INT",    {"default": 720,  "min": 256, "max": 2048, "step": 16}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("first_frame", "video_path")
+    FUNCTION = "generate"
+    CATEGORY = "Cosmos3"
+
+    def generate(
+        self,
+        pipeline,
+        prompt,
+        num_frames,
+        resolution,
+        fps,
+        num_inference_steps,
+        guidance_scale,
+        seed,
+        filename_prefix="cosmos3/t2v",
+        negative_prompt=None,
+        custom_width=1280,
+        custom_height=720,
+    ):
+        import inspect
+
+        if resolution == "custom":
+            w, h = custom_width, custom_height
+        else:
+            w, h = RESOLUTIONS[resolution]
+        w = (w // 16) * 16
+        h = (h // 16) * 16
+
+        generator = torch.Generator(device=mm.get_torch_device()).manual_seed(seed)
+
+        # Update sample_args with step/guidance values
+        try:
+            import diffusers_cosmos3 as _dc3_v
+            _sa_dir_v = pathlib.Path(_dc3_v.__file__).parent / "sample_args"
+            for _m in ("text2video", "image2video"):
+                _pv = _sa_dir_v / f"{_m}.json"
+                if _pv.exists():
+                    _dv = json.loads(_pv.read_text())
+                    _dv["num_steps"] = num_inference_steps
+                    _dv["guidance"] = guidance_scale
+                    _pv.write_text(json.dumps(_dv, indent=2))
+        except Exception as _e:
+            print(f"[Cosmos3 T2V] Warning: could not update sample_args: {_e}")
+
+        kwargs = dict(
+            prompt=prompt,
+            width=w,
+            height=h,
+            num_frames=num_frames,
+            fps=float(fps),
+            generator=generator,
+        )
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+
+        sig = inspect.signature(pipeline.__call__)
+        if "num_inference_steps" in sig.parameters:
+            kwargs["num_inference_steps"] = num_inference_steps
+        if "guidance_scale" in sig.parameters:
+            kwargs["guidance_scale"] = guidance_scale
+
+        print(f"[Cosmos3 T2V] {w}×{h} | {num_frames} frames @ {fps:.0f}fps | "
+              f"seed={seed} | steps={num_inference_steps}")
+        result = pipeline(**kwargs)
+
+        # result: list[Tensor[C, T, H, W]] in [0, 1]
+        frames_chw  = result[0].float().clamp(0.0, 1.0)  # [C, T, H, W]
+        frames_thwc = frames_chw.permute(1, 2, 3, 0)      # [T, H, W, C]
+
+        # ── save MP4 ──────────────────────────────────────────────────────────
+        video_path = ""
+        try:
+            import imageio.v3 as iio
+            frames_np = (frames_thwc.cpu().numpy() * 255).astype(np.uint8)
+
+            _safe = filename_prefix.strip("/\\")
+            _save_dir = os.path.join(
+                folder_paths.get_output_directory(),
+                os.path.dirname(_safe) or "cosmos3/t2v"
+            )
+            os.makedirs(_save_dir, exist_ok=True)
+            _base = os.path.basename(_safe) or "t2v"
+            _fname = f"{_base}_{seed}_{num_frames}f.mp4"
+            video_path = os.path.join(_save_dir, _fname)
+
+            iio.imwrite(video_path, frames_np, fps=fps, codec="h264", quality=8)
+            print(f"[Cosmos3 T2V] Saved {num_frames} frames → {video_path}")
+        except Exception as _ve:
+            print(f"[Cosmos3 T2V] Warning: MP4 save failed ({_ve})")
+
+        # Return first frame as IMAGE for preview / Graydient capture
+        first_frame = frames_thwc[0:1]  # [1, H, W, C]
+        return (first_frame, video_path)
+
+
 # ── registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
     "Cosmos3ModelLoader":       Cosmos3ModelLoader,
     "Cosmos3PromptEnricher":    Cosmos3PromptEnricher,
     "Cosmos3T2ISampler":        Cosmos3T2ISampler,
+    "Cosmos3T2VSampler":        Cosmos3T2VSampler,
     "Cosmos3LoadImageFromURL":  Cosmos3LoadImageFromURL,
 }
 
@@ -618,5 +752,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Cosmos3ModelLoader":       "Cosmos3 Model Loader",
     "Cosmos3PromptEnricher":    "Cosmos3 Prompt Enricher",
     "Cosmos3T2ISampler":        "Cosmos3 T2I / I2I Sampler",
+    "Cosmos3T2VSampler":        "Cosmos3 T2V Sampler",
     "Cosmos3LoadImageFromURL":  "Cosmos3 Load Image From URL",
 }
