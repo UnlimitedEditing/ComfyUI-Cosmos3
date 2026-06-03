@@ -365,9 +365,10 @@ class Cosmos3T2ISampler:
                 "seed":                 ("INT",   {"default": 0,   "min": 0,   "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
-                "init_image":       ("IMAGE",  {"tooltip": "Connect for image-to-image mode. "
-                                                "The model conditions on this image and edits "
-                                                "it according to the prompt."}),
+                "init_image":       ("IMAGE",  {"tooltip": "Connect for image-to-image mode."}),
+                "strength":         ("FLOAT",  {"default": 0.75, "min": 0.05, "max": 1.0, "step": 0.05,
+                                                "tooltip": "0 = keep input unchanged, 1 = full regeneration. "
+                                                           "Ignored when init_image is not connected."}),
                 "negative_prompt":  ("STRING", {"multiline": True, "forceInput": True}),
                 "custom_width":     ("INT",    {"default": 1280, "min": 256, "max": 2048, "step": 16}),
                 "custom_height":    ("INT",    {"default": 720,  "min": 256, "max": 2048, "step": 16}),
@@ -388,6 +389,7 @@ class Cosmos3T2ISampler:
         guidance_scale,
         seed,
         init_image=None,
+        strength=0.75,
         negative_prompt=None,
         custom_width=1280,
         custom_height=720,
@@ -415,7 +417,7 @@ class Cosmos3T2ISampler:
                 _p = _sa_dir / f"{_mode}.json"
                 if _p.exists():
                     _d = json.loads(_p.read_text())
-                    _d["num_steps"] = num_inference_steps
+                    _d["num_steps"] = effective_steps
                     _d["guidance"] = guidance_scale
                     _p.write_text(json.dumps(_d, indent=2))
         except Exception as _e:
@@ -430,6 +432,36 @@ class Cosmos3T2ISampler:
             pil_init = Image.fromarray(img_np, mode="RGB")
 
         mode = "I2I" if pil_init is not None else "T2I"
+        strength = float(strength) if pil_init is not None else 1.0
+
+        # ── strength-based noise injection (I2I only) ─────────────────────────
+        # Encode the input image to the pipeline's latent space, mix with random
+        # noise at the given strength, and pass as the denoising starting point.
+        # effective_steps = round(strength * steps) ensures we only run the portion
+        # of the diffusion trajectory corresponding to our noise level.
+        effective_steps = num_inference_steps
+        if pil_init is not None and strength < 1.0:
+            try:
+                _dev = mm.get_torch_device()
+                # 1. Load + preprocess to [3, 1, H, W] in [-1, 1] (matches pipeline internals)
+                _img_tensor = pipeline._load_image_as_tensor(pil_init, h, w)  # [3, 1, H, W]
+                _img_input  = _img_tensor.unsqueeze(0).to(_dev, torch.bfloat16)  # [1, 3, 1, H, W]
+                # 2. Encode to latent space
+                with torch.no_grad():
+                    _x0 = pipeline.vision_tokenizer.encode(_img_input).contiguous().float().cpu()
+                # 3. Mix: (1 - strength) * clean + strength * noise
+                _noise      = torch.randn_like(_x0)
+                _mixed      = (1.0 - strength) * _x0 + strength * _noise
+                effective_steps = max(1, round(num_inference_steps * strength))
+                print(f"[Cosmos3 I2I] strength={strength:.2f} → {effective_steps} effective steps, "
+                      f"latent shape={list(_x0.shape)}")
+            except Exception as _e:
+                print(f"[Cosmos3 I2I] Warning: strength encoding failed ({_e}). "
+                      f"Falling back to concept-level conditioning.")
+                _mixed = None
+        else:
+            _mixed = None
+        # ─────────────────────────────────────────────────────────────────────
 
         # Base kwargs — always supported by Cosmos3OmniDiffusersPipeline
         kwargs = dict(
@@ -441,6 +473,8 @@ class Cosmos3T2ISampler:
         )
         if pil_init is not None:
             kwargs["image"] = pil_init
+        if _mixed is not None:
+            kwargs["noises"] = [_mixed]  # list[Tensor] matching x0_tokens_vision shape
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
@@ -452,15 +486,13 @@ class Cosmos3T2ISampler:
             kwargs["guidance_scale"] = guidance_scale
 
         # Warn if sequential offload + high step count will likely exceed Graydient timeout.
-        # Sequential offload: ~53s warmup + ~6s/step on 4090.
-        # 10 steps ≈ 107s safe. 15 steps ≈ 143s ok. 25 steps ≈ 197s + overhead = timeout risk.
-        if not hasattr(pipeline, "_device_map_set") and num_inference_steps > 15:
+        if not hasattr(pipeline, "_device_map_set") and effective_steps > 15:
             print(
-                f"[Cosmos3] WARNING: {num_inference_steps} steps on sequential CPU offload "
-                f"(< 40GB GPU) may exceed Graydient timeout. Recommend ≤ 15 steps."
+                f"[Cosmos3] WARNING: {effective_steps} steps on sequential CPU offload "
+                f"may exceed Graydient timeout. Recommend ≤ 15 steps total."
             )
 
-        print(f"[Cosmos3 {mode}] Generating {w}x{h} | seed={seed}")
+        print(f"[Cosmos3 {mode}] {w}x{h} | seed={seed} | steps={effective_steps} | strength={strength:.2f}")
         result = pipeline(**kwargs)
 
         # Cosmos3OmniDiffusersPipeline returns list[Tensor[C, T, H, W]] in [0, 1]
