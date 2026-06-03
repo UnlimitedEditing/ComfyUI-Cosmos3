@@ -210,15 +210,28 @@ class Cosmos3ModelLoader:
 
         def _safe_tokenize_caption(caption, is_video=False, use_system_prompt=False):
             result = _orig_tc(caption, is_video=is_video, use_system_prompt=use_system_prompt)
+
+            # Newer transformers returns BatchEncoding instead of list[int]
+            # BatchEncoding is dict-like; iterating gives keys ('input_ids', ...) not token IDs
+            if hasattr(result, "input_ids"):
+                ids = result.input_ids
+                # input_ids may be [[id1, id2, ...]] (batched) or [id1, id2, ...] (flat)
+                if isinstance(ids, list) and ids and isinstance(ids[0], list):
+                    ids = ids[0]
+                elif hasattr(ids, "tolist"):   # tensor
+                    ids = ids.squeeze().tolist()
+                result = ids
+                print(f"[Cosmos3] tokenize_caption: unwrapped BatchEncoding → {len(result)} token IDs")
+
             if isinstance(result, str):
-                print("[Cosmos3] tokenize_caption returned str — re-encoding as token IDs")
+                print("[Cosmos3] tokenize_caption returned str — re-encoding")
                 result = pipe.text_tokenizer.encode(result, add_special_tokens=False)
             elif isinstance(result, list) and result and not isinstance(result[0], int):
-                # Flatten one level of nesting if needed
                 flat = []
                 for item in result:
                     (flat.extend(item) if isinstance(item, list) else flat.append(int(item)))
                 result = flat
+
             return result
 
         pipe.tokenize_caption = _safe_tokenize_caption
@@ -253,7 +266,18 @@ class Cosmos3ModelLoader:
                     fixed = []
                     changed = False
                     for tokens in text_idx:
-                        if isinstance(tokens, str):
+                        if hasattr(tokens, "input_ids"):
+                            # BatchEncoding — extract the flat token ID list
+                            ids = tokens.input_ids
+                            if isinstance(ids, list) and ids and isinstance(ids[0], list):
+                                tokens = ids[0]
+                            elif hasattr(ids, "tolist"):
+                                tokens = ids.squeeze().tolist()
+                            else:
+                                tokens = ids
+                            print(f"[Cosmos3] Unwrapped BatchEncoding → {len(tokens)} token IDs")
+                            changed = True
+                        elif isinstance(tokens, str):
                             print(f"[Cosmos3] Fixing str token seq (len={len(tokens)}) — re-tokenizing")
                             tokens = pipe.text_tokenizer.encode(tokens)
                             changed = True
