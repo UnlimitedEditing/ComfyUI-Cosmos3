@@ -401,6 +401,26 @@ class Cosmos3T2ISampler:
         else:
             w, h = RESOLUTIONS[resolution]
 
+        # ── auto-match resolution to input image aspect ratio (I2I) ──────────
+        # When an init_image is provided and the user hasn't chosen "custom",
+        # snap to the closest supported resolution so the input doesn't get
+        # distorted by an incompatible aspect ratio crop.
+        if init_image is not None and resolution != "custom":
+            _in_w = init_image.shape[2]   # ComfyUI tensor: (B, H, W, C)
+            _in_h = init_image.shape[1]
+            _in_ar = _in_w / _in_h
+            _best_res, _best_diff = (w, h), float("inf")
+            for _rk, _rd in RESOLUTIONS.items():
+                if _rd is None:
+                    continue
+                _res_ar = _rd[0] / _rd[1]
+                _diff = abs(_res_ar - _in_ar)
+                if _diff < _best_diff:
+                    _best_diff, _best_res = _diff, _rd
+            w, h = _best_res
+            print(f"[Cosmos3 I2I] Input AR {_in_ar:.3f} → auto-matched resolution {w}×{h}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # Cosmos3 requires dimensions divisible by 16
         w = (w // 16) * 16
         h = (h // 16) * 16
