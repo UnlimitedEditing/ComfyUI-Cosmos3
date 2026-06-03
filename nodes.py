@@ -222,20 +222,17 @@ class Cosmos3ModelLoader:
         def _safe_tokenize_caption(caption, is_video=False, use_system_prompt=False):
             result = _orig_tc(caption, is_video=is_video, use_system_prompt=use_system_prompt)
 
-            # Newer transformers returns BatchEncoding instead of list[int]
-            # BatchEncoding is dict-like; iterating gives keys ('input_ids', ...) not token IDs
+            # Newer transformers returns BatchEncoding instead of list[int].
+            # Iterating over BatchEncoding yields dict keys (strings), not token IDs.
             if hasattr(result, "input_ids"):
                 ids = result.input_ids
-                # input_ids may be [[id1, id2, ...]] (batched) or [id1, id2, ...] (flat)
                 if isinstance(ids, list) and ids and isinstance(ids[0], list):
                     ids = ids[0]
-                elif hasattr(ids, "tolist"):   # tensor
+                elif hasattr(ids, "tolist"):
                     ids = ids.squeeze().tolist()
                 result = ids
-                print(f"[Cosmos3] tokenize_caption: unwrapped BatchEncoding → {len(result)} token IDs")
 
             if isinstance(result, str):
-                print("[Cosmos3] tokenize_caption returned str — re-encoding")
                 result = pipe.text_tokenizer.encode(result, add_special_tokens=False)
             elif isinstance(result, list) and result and not isinstance(result[0], int):
                 flat = []
@@ -265,20 +262,11 @@ class Cosmos3ModelLoader:
                     text_idx = args[1]
 
                 if text_idx is not None:
-                    first = text_idx[0] if text_idx else None
-                    first0 = first[0] if (first and hasattr(first, '__getitem__') and len(first) > 0) else "N/A"
-                    print(
-                        f"[Cosmos3] pack_input_sequence intercepted: "
-                        f"len={len(text_idx)}, "
-                        f"first type={type(first).__name__}, "
-                        f"first[0] type={type(first0).__name__} val={repr(first0)[:40]}"
-                    )
-                    # Fix: ensure every element of input_text_indexes is list[int]
                     fixed = []
                     changed = False
                     for tokens in text_idx:
                         if hasattr(tokens, "input_ids"):
-                            # BatchEncoding — extract the flat token ID list
+                            # BatchEncoding (newer transformers) — extract flat list[int]
                             ids = tokens.input_ids
                             if isinstance(ids, list) and ids and isinstance(ids[0], list):
                                 tokens = ids[0]
@@ -286,15 +274,12 @@ class Cosmos3ModelLoader:
                                 tokens = ids.squeeze().tolist()
                             else:
                                 tokens = ids
-                            print(f"[Cosmos3] Unwrapped BatchEncoding → {len(tokens)} token IDs")
                             changed = True
                         elif isinstance(tokens, str):
-                            print(f"[Cosmos3] Fixing str token seq (len={len(tokens)}) — re-tokenizing")
                             tokens = pipe.text_tokenizer.encode(tokens)
                             changed = True
                         elif (isinstance(tokens, list) and tokens
                               and not isinstance(tokens[0], int)):
-                            print(f"[Cosmos3] Fixing non-int tokens (first_type={type(tokens[0]).__name__})")
                             tokens = [int(t) for t in tokens]
                             changed = True
                         fixed.append(tokens)
@@ -304,7 +289,6 @@ class Cosmos3ModelLoader:
                 return _orig_pis(*args, **kwargs)
 
             _dc3_pl.pack_input_sequence = _safe_pack_input_sequence
-            print("[Cosmos3] Patched pipeline.pack_input_sequence")
         except Exception as _pe:
             print(f"[Cosmos3] Could not patch pack_input_sequence: {_pe}")
         # ─────────────────────────────────────────────────────────────────────
@@ -466,6 +450,15 @@ class Cosmos3T2ISampler:
             kwargs["num_inference_steps"] = num_inference_steps
         if "guidance_scale" in sig.parameters:
             kwargs["guidance_scale"] = guidance_scale
+
+        # Warn if sequential offload + high step count will likely exceed Graydient timeout.
+        # Sequential offload: ~53s warmup + ~6s/step on 4090.
+        # 10 steps ≈ 107s safe. 15 steps ≈ 143s ok. 25 steps ≈ 197s + overhead = timeout risk.
+        if not hasattr(pipeline, "_device_map_set") and num_inference_steps > 15:
+            print(
+                f"[Cosmos3] WARNING: {num_inference_steps} steps on sequential CPU offload "
+                f"(< 40GB GPU) may exceed Graydient timeout. Recommend ≤ 15 steps."
+            )
 
         print(f"[Cosmos3 {mode}] Generating {w}x{h} | seed={seed}")
         result = pipeline(**kwargs)
