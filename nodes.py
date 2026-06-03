@@ -228,9 +228,12 @@ class Cosmos3ModelLoader:
         # pack_input_sequence uses them, and log what we actually see so we can
         # diagnose the root cause.
         try:
-            import diffusers_cosmos3.sequence_packing as _dc3_sp
+            # IMPORTANT: pipeline.py does `from .sequence_packing import pack_input_sequence`
+            # creating a LOCAL binding at import time.  Patching sequence_packing module
+            # attribute doesn't affect that local name.  Patch the PIPELINE module instead.
+            import diffusers_cosmos3.pipeline as _dc3_pl
 
-            _orig_pis = _dc3_sp.pack_input_sequence
+            _orig_pis = _dc3_pl.pack_input_sequence
 
             def _safe_pack_input_sequence(*args, **kwargs):
                 text_idx = kwargs.get("input_text_indexes")
@@ -239,13 +242,14 @@ class Cosmos3ModelLoader:
 
                 if text_idx is not None:
                     first = text_idx[0] if text_idx else None
+                    first0 = first[0] if (first and hasattr(first, '__getitem__') and len(first) > 0) else "N/A"
                     print(
-                        f"[Cosmos3] pack_input_sequence: "
-                        f"input_text_indexes len={len(text_idx)}, "
+                        f"[Cosmos3] pack_input_sequence intercepted: "
+                        f"len={len(text_idx)}, "
                         f"first type={type(first).__name__}, "
-                        f"first[0] type={type(first[0]).__name__ if first else 'empty'}"
+                        f"first[0] type={type(first0).__name__} val={repr(first0)[:40]}"
                     )
-                    # Fix: if any token list is a string, re-encode it
+                    # Fix: ensure every element of input_text_indexes is list[int]
                     fixed = []
                     changed = False
                     for tokens in text_idx:
@@ -255,22 +259,17 @@ class Cosmos3ModelLoader:
                             changed = True
                         elif (isinstance(tokens, list) and tokens
                               and not isinstance(tokens[0], int)):
-                            print(f"[Cosmos3] Fixing non-int token seq (first type={type(tokens[0]).__name__}) — casting")
+                            print(f"[Cosmos3] Fixing non-int tokens (first_type={type(tokens[0]).__name__})")
                             tokens = [int(t) for t in tokens]
                             changed = True
                         fixed.append(tokens)
                     if changed:
-                        if "input_text_indexes" in kwargs:
-                            kwargs["input_text_indexes"] = fixed
-                        else:
-                            args = list(args)
-                            args[1] = fixed
-                            args = tuple(args)
+                        kwargs["input_text_indexes"] = fixed
 
                 return _orig_pis(*args, **kwargs)
 
-            _dc3_sp.pack_input_sequence = _safe_pack_input_sequence
-            print("[Cosmos3] Patched pack_input_sequence")
+            _dc3_pl.pack_input_sequence = _safe_pack_input_sequence
+            print("[Cosmos3] Patched pipeline.pack_input_sequence")
         except Exception as _pe:
             print(f"[Cosmos3] Could not patch pack_input_sequence: {_pe}")
         # ─────────────────────────────────────────────────────────────────────
