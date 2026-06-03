@@ -609,14 +609,19 @@ class Cosmos3LoadImageFromURL:
 
 class Cosmos3T2VSampler:
     """
-    Cosmos3-Nano Text-to-Video sampler.
+    Cosmos3-Nano Text-to-Video (and Image-to-Video) sampler.
+
+    Leave init_image unconnected for T2V.
+    Connect init_image for I2V — the model animates from the input image,
+    with the first frame anchored to it and subsequent frames generated
+    by the world model based on the prompt.
 
     Outputs the first frame as a ComfyUI IMAGE (for preview + Graydient capture)
     and saves the full video as MP4 to the output directory.
 
     num_frames tips:
       • Stick to 4k+1 values (5, 9, 17, 33, 65, 129, 189) for clean temporal compression.
-      • Start with 33 frames (~1.4 s) to test memory; scale up from there.
+      • Start with 33 frames (~1.4 s) to probe memory; scale up from there.
       • 189 frames (full 8 s) will likely OOM on GPUs < 48 GB even with INT4.
     """
 
@@ -636,6 +641,7 @@ class Cosmos3T2VSampler:
                 "filename_prefix":     ("STRING", {"default": "cosmos3/t2v"}),
             },
             "optional": {
+                "init_image":      ("IMAGE",  {"tooltip": "Connect for I2V mode — animates from this image"}),
                 "negative_prompt": ("STRING", {"multiline": True, "forceInput": True}),
                 "custom_width":    ("INT",    {"default": 1280, "min": 256, "max": 2048, "step": 16}),
                 "custom_height":   ("INT",    {"default": 720,  "min": 256, "max": 2048, "step": 16}),
@@ -658,6 +664,7 @@ class Cosmos3T2VSampler:
         guidance_scale,
         seed,
         filename_prefix="cosmos3/t2v",
+        init_image=None,
         negative_prompt=None,
         custom_width=1280,
         custom_height=720,
@@ -687,6 +694,14 @@ class Cosmos3T2VSampler:
         except Exception as _e:
             print(f"[Cosmos3 T2V] Warning: could not update sample_args: {_e}")
 
+        # Convert init_image ComfyUI tensor → PIL if provided (I2V mode)
+        pil_init = None
+        if init_image is not None:
+            _img_np = (init_image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            pil_init = Image.fromarray(_img_np, mode="RGB")
+
+        mode = "I2V" if pil_init is not None else "T2V"
+
         kwargs = dict(
             prompt=prompt,
             width=w,
@@ -695,6 +710,10 @@ class Cosmos3T2VSampler:
             fps=float(fps),
             generator=generator,
         )
+        if pil_init is not None:
+            kwargs["image"] = pil_init
+            # Anchor first frame to the input image; pipeline generates the rest
+            kwargs["condition_frame_indexes"] = [0]
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
@@ -704,7 +723,7 @@ class Cosmos3T2VSampler:
         if "guidance_scale" in sig.parameters:
             kwargs["guidance_scale"] = guidance_scale
 
-        print(f"[Cosmos3 T2V] {w}×{h} | {num_frames} frames @ {fps:.0f}fps | "
+        print(f"[Cosmos3 {mode}] {w}×{h} | {num_frames} frames @ {fps:.0f}fps | "
               f"seed={seed} | steps={num_inference_steps}")
         result = pipeline(**kwargs)
 
