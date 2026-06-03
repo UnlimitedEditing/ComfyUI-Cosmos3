@@ -110,16 +110,16 @@ class Cosmos3ModelLoader:
         _sample_args_dir = pathlib.Path(_dc3_pkg.__file__).parent / "sample_args"
         _sample_args_dir.mkdir(exist_ok=True)
         _mode_defaults = {
-            "text2video":  {"guidance": 6.0, "num_steps": 35, "shift": 10.0,
+            "text2video":  {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
                             "negative_prompt": "", "negative_prompt_keep_metadata": False},
-            "image2video": {"guidance": 6.0, "num_steps": 35, "shift": 10.0,
+            "image2video": {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
                             "negative_prompt": "", "negative_prompt_keep_metadata": False},
         }
         for _mode, _defs in _mode_defaults.items():
             _p = _sample_args_dir / f"{_mode}.json"
-            if not _p.exists():
-                _p.write_text(json.dumps(_defs, indent=2))
-                print(f"[Cosmos3] Created missing sample_args/{_mode}.json")
+            # Always overwrite so persistent containers pick up step-count changes
+            _p.write_text(json.dumps(_defs, indent=2))
+            print(f"[Cosmos3] Wrote sample_args/{_mode}.json (num_steps={_defs['num_steps']})")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── RoPE 'default' patch ──────────────────────────────────────────────
@@ -199,6 +199,31 @@ class Cosmos3ModelLoader:
         # ─────────────────────────────────────────────────────────────────────
 
         print("[Cosmos3] Pipeline loaded.")
+
+        # ── tokenize_caption safety patch ─────────────────────────────────────
+        # In some transformers/tokenizer configurations apply_chat_template(
+        # tokenize=True) returns a formatted string instead of list[int].
+        # The pipeline then iterates over that string char-by-char and passes
+        # characters as token IDs → ValueError in torch.tensor().
+        # Wrap the method to guarantee list[int] output.
+        _orig_tc = pipe.tokenize_caption
+
+        def _safe_tokenize_caption(caption, is_video=False, use_system_prompt=False):
+            result = _orig_tc(caption, is_video=is_video, use_system_prompt=use_system_prompt)
+            if isinstance(result, str):
+                print("[Cosmos3] tokenize_caption returned str — re-encoding as token IDs")
+                result = pipe.text_tokenizer.encode(result, add_special_tokens=False)
+            elif isinstance(result, list) and result and not isinstance(result[0], int):
+                # Flatten one level of nesting if needed
+                flat = []
+                for item in result:
+                    (flat.extend(item) if isinstance(item, list) else flat.append(int(item)))
+                result = flat
+            return result
+
+        pipe.tokenize_caption = _safe_tokenize_caption
+        # ─────────────────────────────────────────────────────────────────────
+
         return (pipe,)
 
 
