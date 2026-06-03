@@ -109,11 +109,22 @@ class Cosmos3ModelLoader:
         # from the README if they're missing.
         _sample_args_dir = pathlib.Path(_dc3_pkg.__file__).parent / "sample_args"
         _sample_args_dir.mkdir(exist_ok=True)
+        # Default negative derived from NVIDIA's canonical negative_prompt.json:
+        # covers the quality failure modes the model was trained to avoid.
+        _COSMOS3_DEFAULT_NEG = (
+            "blurry, low quality, jpeg artifacts, distorted features, unnatural proportions, "
+            "floating subjects, broken geometry, visible compression artifacts, muddy textures, "
+            "color bleeding, waxy skin, extra limbs, asymmetric face, teeth artifacts, "
+            "flat lighting, no shadows, inconsistent light sources, flickering, temporal artifacts, "
+            "shaky camera, rolling shutter, visible tiling, repeated textures, watermark, text, logo"
+        )
         _mode_defaults = {
             "text2video":  {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
-                            "negative_prompt": "", "negative_prompt_keep_metadata": False},
+                            "negative_prompt": _COSMOS3_DEFAULT_NEG,
+                            "negative_prompt_keep_metadata": False},
             "image2video": {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
-                            "negative_prompt": "", "negative_prompt_keep_metadata": False},
+                            "negative_prompt": _COSMOS3_DEFAULT_NEG,
+                            "negative_prompt_keep_metadata": False},
         }
         for _mode, _defs in _mode_defaults.items():
             _p = _sample_args_dir / f"{_mode}.json"
@@ -348,9 +359,13 @@ class Cosmos3PromptEnricher:
 
 class Cosmos3T2ISampler:
     """
-    Cosmos3-Nano Text-to-Image sampler.
+    Cosmos3-Nano Text-to-Image (and Image-to-Image) sampler.
 
-    Prompt: plain text string (wire from Cosmos3PromptEnricher or any STRING node).
+    Leave the 'image' socket unconnected for pure text-to-image.
+    Connect an IMAGE to enable image-conditioned generation — the model
+    uses its world-understanding to edit/reinterpret the scene based on
+    the prompt while preserving spatial structure.
+
     Output: standard ComfyUI IMAGE tensor (1, H, W, C) float32.
     """
 
@@ -361,11 +376,14 @@ class Cosmos3T2ISampler:
                 "pipeline":             ("COSMOS3_PIPELINE",),
                 "prompt":               ("STRING", {"multiline": True, "forceInput": True}),
                 "resolution":           (list(RESOLUTIONS.keys()), {"default": "1280x720 (16:9 HD)"}),
-                "num_inference_steps":  ("INT",   {"default": 30,  "min": 1,   "max": 100, "step": 1}),
+                "num_inference_steps":  ("INT",   {"default": 10,  "min": 1,   "max": 100, "step": 1}),
                 "guidance_scale":       ("FLOAT", {"default": 6.0, "min": 0.0, "max": 20.0, "step": 0.5}),
                 "seed":                 ("INT",   {"default": 0,   "min": 0,   "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
+                "init_image":       ("IMAGE",  {"tooltip": "Connect for image-to-image mode. "
+                                                "The model conditions on this image and edits "
+                                                "it according to the prompt."}),
                 "negative_prompt":  ("STRING", {"multiline": True, "forceInput": True}),
                 "custom_width":     ("INT",    {"default": 1280, "min": 256, "max": 2048, "step": 16}),
                 "custom_height":    ("INT",    {"default": 720,  "min": 256, "max": 2048, "step": 16}),
@@ -385,6 +403,7 @@ class Cosmos3T2ISampler:
         num_inference_steps,
         guidance_scale,
         seed,
+        init_image=None,
         negative_prompt=None,
         custom_width=1280,
         custom_height=720,
@@ -402,14 +421,42 @@ class Cosmos3T2ISampler:
 
         generator = torch.Generator(device=mm.get_torch_device()).manual_seed(seed)
 
+        # ── update sample_args so the pipeline uses our step/guidance values ──
+        # Cosmos3OmniDiffusersPipeline reads num_steps and guidance from
+        # sample_args/text2video.json at call time, not from __call__ kwargs.
+        try:
+            import diffusers_cosmos3 as _dc3_sa
+            _sa_dir = pathlib.Path(_dc3_sa.__file__).parent / "sample_args"
+            for _mode in ("text2video", "image2video"):
+                _p = _sa_dir / f"{_mode}.json"
+                if _p.exists():
+                    _d = json.loads(_p.read_text())
+                    _d["num_steps"] = num_inference_steps
+                    _d["guidance"] = guidance_scale
+                    _p.write_text(json.dumps(_d, indent=2))
+        except Exception as _e:
+            print(f"[Cosmos3] Warning: could not update sample_args: {_e}")
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Convert init_image ComfyUI tensor → PIL if provided (I2I mode)
+        pil_init = None
+        if init_image is not None:
+            import numpy as np
+            img_np = (init_image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            pil_init = Image.fromarray(img_np, mode="RGB")
+
+        mode = "I2I" if pil_init is not None else "T2I"
+
         # Base kwargs — always supported by Cosmos3OmniDiffusersPipeline
         kwargs = dict(
             prompt=prompt,
             width=w,
             height=h,
-            num_frames=1,               # T2I = single frame
+            num_frames=1,               # single frame for both T2I and I2I
             generator=generator,
         )
+        if pil_init is not None:
+            kwargs["image"] = pil_init
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
@@ -420,7 +467,7 @@ class Cosmos3T2ISampler:
         if "guidance_scale" in sig.parameters:
             kwargs["guidance_scale"] = guidance_scale
 
-        print(f"[Cosmos3 T2I] Generating {w}x{h} | seed={seed} (steps/cfg passed if supported)")
+        print(f"[Cosmos3 {mode}] Generating {w}x{h} | seed={seed}")
         result = pipeline(**kwargs)
 
         # Cosmos3OmniDiffusersPipeline returns list[Tensor[C, T, H, W]] in [0, 1]
@@ -432,16 +479,55 @@ class Cosmos3T2ISampler:
         return (image_tensor,)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Cosmos3LoadImageFromURL:
+    """
+    Downloads an image from a URL and returns a ComfyUI IMAGE tensor.
+    Use with Graydient's init_image_url field to feed reference images
+    into the Cosmos3 T2I sampler for image-conditioned generation.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load"
+    CATEGORY = "Cosmos3"
+
+    def load(self, url):
+        import requests
+        from io import BytesIO
+
+        if not url or not url.strip():
+            raise ValueError("[Cosmos3] LoadImageFromURL: url is empty")
+
+        print(f"[Cosmos3] Downloading image from URL...")
+        response = requests.get(url.strip(), timeout=60)
+        response.raise_for_status()
+        pil_image = Image.open(BytesIO(response.content)).convert("RGB")
+        print(f"[Cosmos3] Image loaded: {pil_image.size[0]}×{pil_image.size[1]}")
+        return (pil2tensor(pil_image),)
+
+
 # ── registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
-    "Cosmos3ModelLoader":    Cosmos3ModelLoader,
-    "Cosmos3PromptEnricher": Cosmos3PromptEnricher,
-    "Cosmos3T2ISampler":     Cosmos3T2ISampler,
+    "Cosmos3ModelLoader":       Cosmos3ModelLoader,
+    "Cosmos3PromptEnricher":    Cosmos3PromptEnricher,
+    "Cosmos3T2ISampler":        Cosmos3T2ISampler,
+    "Cosmos3LoadImageFromURL":  Cosmos3LoadImageFromURL,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Cosmos3ModelLoader":    "Cosmos3 Model Loader",
-    "Cosmos3PromptEnricher": "Cosmos3 Prompt Enricher",
-    "Cosmos3T2ISampler":     "Cosmos3 T2I Sampler",
+    "Cosmos3ModelLoader":       "Cosmos3 Model Loader",
+    "Cosmos3PromptEnricher":    "Cosmos3 Prompt Enricher",
+    "Cosmos3T2ISampler":        "Cosmos3 T2I / I2I Sampler",
+    "Cosmos3LoadImageFromURL":  "Cosmos3 Load Image From URL",
 }
