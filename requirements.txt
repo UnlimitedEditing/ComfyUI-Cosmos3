@@ -11,6 +11,7 @@ diffusers @ git+https://github.com/huggingface/diffusers.git
 diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3
 transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3
 accelerate>=0.27.0
+torchao
 transformers>=4.40.0
 huggingface_hub>=0.23.0
 sentencepiece

@@ -66,12 +66,19 @@ class Cosmos3ModelLoader:
     """
 
     MODEL_OPTIONS = ["nvidia/Cosmos3-Nano", "custom"]
+    QUANT_OPTIONS = ["none", "int8", "int4"]
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "model": (cls.MODEL_OPTIONS, {"default": "nvidia/Cosmos3-Nano"}),
+                "quantization": (cls.QUANT_OPTIONS, {"default": "int8",
+                    "tooltip": (
+                        "none  = BF16 (32 GB, needs 48 GB GPU or sequential offload)\n"
+                        "int8  = INT8 weights (16 GB, fits 4090/5090 — RECOMMENDED)\n"
+                        "int4  = INT4 weights ( 8 GB, fits 3090/smaller GPU)"
+                    )}),
             },
             "optional": {
                 "custom_path": ("STRING", {"default": "", "multiline": False,
@@ -84,7 +91,7 @@ class Cosmos3ModelLoader:
     FUNCTION = "load"
     CATEGORY = "Cosmos3"
 
-    def load(self, model, custom_path=""):
+    def load(self, model, quantization="int8", custom_path=""):
         # ── import cosmos3 plugins ────────────────────────────────────────────
         try:
             import transformers_cosmos3  # noqa: F401 — requires transformers>=4.57
@@ -184,28 +191,56 @@ class Cosmos3ModelLoader:
 
             source = model_dir
 
-        # ── adaptive VRAM strategy ────────────────────────────────────────────
-        # 16B model @ bfloat16 ≈ 32 GB weights.  Need headroom for activations.
-        # Threshold: 40 GB — comfortably covers 6000 Ada (48 GB) but not 5090 (32 GB).
-        _HIGH_VRAM_GB = 40.0
+        # ── quantization + adaptive VRAM strategy ────────────────────────────
+        # Memory requirements by quantization level:
+        #   none  → 32 GB BF16 weights  → needs 40 GB+ GPU for balanced
+        #   int8  → 16 GB INT8 weights   → fits 24 GB GPU (4090/5090) with balanced
+        #   int4  →  8 GB INT4 weights   → fits 12 GB GPU
+        # Compute remains in BF16 throughout (weights-only quantization).
         _total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"[Cosmos3] GPU: {torch.cuda.get_device_name(0)} ({_total_vram_gb:.0f} GB)")
+        print(f"[Cosmos3] GPU: {torch.cuda.get_device_name(0)} ({_total_vram_gb:.0f} GB) | quant={quantization}")
 
-        if _total_vram_gb >= _HIGH_VRAM_GB:
-            print("[Cosmos3] High-VRAM mode — device_map='balanced'")
-            pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
-                source,
-                torch_dtype=torch.bfloat16,
-                device_map="balanced",
-            )
+        # VRAM threshold at which we can use device_map='balanced' (all on GPU)
+        # none → need 40 GB+; int8 → 20 GB+ (16 GB weights + 4 GB headroom); int4 → 12 GB+
+        _vram_thresholds = {"none": 40.0, "int8": 20.0, "int4": 12.0}
+        _vram_ok = _total_vram_gb >= _vram_thresholds.get(quantization, 40.0)
+
+        # Load pipeline to CPU first (avoids OOM during weight loading)
+        pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
+            source,
+            torch_dtype=torch.bfloat16,
+            # no device_map — we'll handle placement after optional quantization
+        )
+
+        # Apply torchao weight-only quantization if requested
+        if quantization in ("int8", "int4"):
+            try:
+                from torchao.quantization import quantize_, int8_weight_only, int4_weight_only
+                _qfn = int8_weight_only() if quantization == "int8" else int4_weight_only()
+                quantize_(pipe.transformer, _qfn)
+                _q_gb = _total_vram_gb  # recalculate effective footprint for logging
+                print(f"[Cosmos3] {quantization.upper()} quantization applied to transformer")
+            except ImportError:
+                print("[Cosmos3] WARNING: torchao not installed — falling back to BF16. "
+                      "Add 'torchao' to pip requirements.")
+                quantization = "none"
+            except Exception as _qe:
+                print(f"[Cosmos3] WARNING: quantization failed ({_qe}) — falling back to BF16")
+                quantization = "none"
+
+        # Place model: balanced on GPU if it fits, sequential CPU offload otherwise
+        if _vram_ok:
+            print(f"[Cosmos3] Moving pipeline to GPU (device_map='balanced')")
+            try:
+                pipe = pipe.to("cuda")
+            except Exception:
+                # Fallback: some pipeline components may resist .to(), use accelerate
+                from accelerate import dispatch_model, infer_auto_device_map
+                device_map = infer_auto_device_map(pipe, max_memory={0: f"{int(_total_vram_gb - 2)}GiB"})
+                pipe = dispatch_model(pipe, device_map=device_map)
         else:
-            print(f"[Cosmos3] Low-VRAM mode ({_total_vram_gb:.0f} GB) — "
-                  "loading to CPU then enabling sequential offload (slower but fits)")
-            pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
-                source,
-                torch_dtype=torch.bfloat16,
-                # no device_map → loads to CPU
-            )
+            print(f"[Cosmos3] Sequential CPU offload "
+                  f"(GPU {_total_vram_gb:.0f} GB < {_vram_thresholds.get(quantization, 40):.0f} GB threshold)")
             pipe.enable_sequential_cpu_offload()
         # ─────────────────────────────────────────────────────────────────────
 
