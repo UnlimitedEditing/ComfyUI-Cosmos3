@@ -711,14 +711,20 @@ class Cosmos3T2VSampler:
             kwargs["num_inference_steps"] = num_inference_steps
         if "guidance_scale" in sig.parameters:
             kwargs["guidance_scale"] = guidance_scale
+        if "output_type" in sig.parameters:
+            # Default output_type is "pil" (list[PIL.Image]) on Cosmos3OmniPipeline —
+            # request a tensor directly so the .float()/.permute() below has something
+            # to operate on.
+            kwargs["output_type"] = "pt"
 
         print(f"[Cosmos3 {mode}] {w}×{h} | {num_frames} frames @ {fps:.0f}fps | "
               f"seed={seed} | steps={num_inference_steps}")
         result = pipeline(**kwargs)
 
-        # result: list[Tensor[C, T, H, W]] in [0, 1]
-        frames_chw  = result[0].float().clamp(0.0, 1.0)  # [C, T, H, W]
-        frames_thwc = frames_chw.permute(1, 2, 3, 0)      # [T, H, W, C]
+        # Cosmos3OmniPipeline with output_type="pt" returns video as Tensor[T, C, H, W]
+        # in [0, 1] (frames first — NOT [C, T, H, W]), per its own docstring.
+        frames_tchw = result[0].float().clamp(0.0, 1.0)  # [T, C, H, W]
+        frames_thwc = frames_tchw.permute(0, 2, 3, 1)     # [T, H, W, C]
 
         # ── save MP4 ──────────────────────────────────────────────────────────
         video_path = ""
