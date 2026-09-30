@@ -192,45 +192,55 @@ class Cosmos3ModelLoader:
         elif quantization in ("int8", "int4"):
             pipe = Cosmos3OmniDiffusersPipeline.from_pretrained(
                 source, torch_dtype=torch.bfloat16
-                # no device_map — quantize on CPU, then offload
             )
             _quant_applied = False
-            try:
-                from torchao.quantization import quantize_, Int8WeightOnlyConfig, Int4WeightOnlyConfig
-                _qfn = Int8WeightOnlyConfig() if quantization == "int8" else Int4WeightOnlyConfig()
-                quantize_(pipe.transformer, _qfn)
-                _quant_applied = True
-                print(f"[Cosmos3] {quantization.upper()} applied — transformer ~"
-                      f"{'16' if quantization == 'int8' else '8'} GB")
-            except Exception as _qe:
-                # Catch both ImportError (torchao missing) and runtime failures
-                # (e.g. CUDA extension mismatch for this GPU arch)
-                print(f"[Cosmos3] WARNING: {quantization.upper()} failed ({type(_qe).__name__}: {_qe!s:.120}) "
-                      f"— using BF16 + sequential offload")
-                quantization = "none"
-
-            # Offload strategy after quantization:
-            # torchao's quantized tensor subclass is incompatible with accelerate's
-            # enable_model_cpu_offload()/enable_sequential_cpu_offload() hooks — both
-            # do a per-submodule .to(execution_device) swap at forward time, which
-            # crashes on quantized storage with "Attempted to set the storage of a
-            # tensor on device cuda:0 to a storage on different device cpu" (confirmed
-            # live 2026-09-30, Cosmos3-Edge on RTX 5090 — enable_model_cpu_offload()
-            # itself succeeds, the crash only surfaces once generation actually runs).
-            # With this much VRAM headroom the whole quantized pipeline fits resident
-            # on GPU anyway, so skip the offload hooks entirely rather than fight them.
             _transformer_headroom = {"int8": 20.0, "int4": 12.0}
-            if _quant_applied and _total_vram_gb >= _transformer_headroom.get(quantization, 20.0):
+            _has_headroom = _total_vram_gb >= _transformer_headroom.get(quantization, 20.0)
+
+            # torchao's quantized tensor subclass cannot survive ANY subsequent
+            # .to(device) call in this environment — confirmed live 2026-09-30
+            # (Cosmos3-Edge, RTX 5090): plain pipe.to("cuda"), accelerate's
+            # enable_model_cpu_offload(), and enable_sequential_cpu_offload() all
+            # crashed identically inside torchao/utils.py's storage-aliasing dispatch
+            # ("Attempted to set the storage of a tensor on device X to a storage on
+            # different device Y"). Root cause: torchao's compiled extensions
+            # (_C_mxfp8/_C_cutlass) failed to load ("Unable to import torchao Tensor
+            # objects"), leaving its device-move dispatch broken. Quantizing BEFORE
+            # the device move (the original order) therefore always crashed on the
+            # move that followed, regardless of which offload strategy was tried.
+            #
+            # Fix: when there's headroom, move to GPU FIRST as plain BF16 (a device
+            # move that's proven to work), then quantize the already GPU-resident
+            # transformer in place — no further device move is needed afterward.
+            if _has_headroom:
+                pipe.to("cuda")
                 try:
-                    pipe.to("cuda")
-                    print("[Cosmos3] Quantized pipeline resident on GPU (no offload hooks — "
-                          "avoids torchao/accelerate incompatibility)")
-                except Exception as _e:
-                    print(f"[Cosmos3] Full GPU residency failed ({_e}) → sequential offload "
-                          f"(note: sequential offload may hit the same torchao/accelerate issue "
-                          f"since quantization is still active)")
-                    pipe.enable_sequential_cpu_offload()
+                    from torchao.quantization import quantize_, Int8WeightOnlyConfig, Int4WeightOnlyConfig
+                    _qfn = Int8WeightOnlyConfig() if quantization == "int8" else Int4WeightOnlyConfig()
+                    quantize_(pipe.transformer, _qfn)
+                    _quant_applied = True
+                    print(f"[Cosmos3] {quantization.upper()} applied on GPU-resident transformer "
+                          f"— ~{'16' if quantization == 'int8' else '8'} GB, no further device move needed")
+                except Exception as _qe:
+                    print(f"[Cosmos3] WARNING: {quantization.upper()} failed ({type(_qe).__name__}: {_qe!s:.120}) "
+                          f"— continuing BF16 (already resident on GPU)")
+                    quantization = "none"
             else:
+                # Not enough VRAM for full BF16 residency even before quantizing —
+                # quantize on CPU first to shrink the footprint, then offload. This
+                # path can still hit the torchao device-move issue above; it's the
+                # only option available when genuinely short on VRAM.
+                try:
+                    from torchao.quantization import quantize_, Int8WeightOnlyConfig, Int4WeightOnlyConfig
+                    _qfn = Int8WeightOnlyConfig() if quantization == "int8" else Int4WeightOnlyConfig()
+                    quantize_(pipe.transformer, _qfn)
+                    _quant_applied = True
+                    print(f"[Cosmos3] {quantization.upper()} applied — transformer ~"
+                          f"{'16' if quantization == 'int8' else '8'} GB")
+                except Exception as _qe:
+                    print(f"[Cosmos3] WARNING: {quantization.upper()} failed ({type(_qe).__name__}: {_qe!s:.120}) "
+                          f"— using BF16 + sequential offload")
+                    quantization = "none"
                 print("[Cosmos3] Sequential CPU offload")
                 pipe.enable_sequential_cpu_offload()
 
