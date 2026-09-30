@@ -210,16 +210,25 @@ class Cosmos3ModelLoader:
                 quantization = "none"
 
             # Offload strategy after quantization:
-            # INT8 transformer (16 GB) fits on any modern GPU → model_cpu_offload
-            # (whole sub-models swap in/out, much faster than layer-by-layer)
-            # Fallback: sequential offload if that also fails
+            # torchao's quantized tensor subclass is incompatible with accelerate's
+            # enable_model_cpu_offload()/enable_sequential_cpu_offload() hooks — both
+            # do a per-submodule .to(execution_device) swap at forward time, which
+            # crashes on quantized storage with "Attempted to set the storage of a
+            # tensor on device cuda:0 to a storage on different device cpu" (confirmed
+            # live 2026-09-30, Cosmos3-Edge on RTX 5090 — enable_model_cpu_offload()
+            # itself succeeds, the crash only surfaces once generation actually runs).
+            # With this much VRAM headroom the whole quantized pipeline fits resident
+            # on GPU anyway, so skip the offload hooks entirely rather than fight them.
             _transformer_headroom = {"int8": 20.0, "int4": 12.0}
             if _quant_applied and _total_vram_gb >= _transformer_headroom.get(quantization, 20.0):
                 try:
-                    pipe.enable_model_cpu_offload()
-                    print(f"[Cosmos3] Model CPU offload enabled (transformer on GPU when active)")
+                    pipe.to("cuda")
+                    print("[Cosmos3] Quantized pipeline resident on GPU (no offload hooks — "
+                          "avoids torchao/accelerate incompatibility)")
                 except Exception as _e:
-                    print(f"[Cosmos3] model_cpu_offload failed ({_e}) → sequential offload")
+                    print(f"[Cosmos3] Full GPU residency failed ({_e}) → sequential offload "
+                          f"(note: sequential offload may hit the same torchao/accelerate issue "
+                          f"since quantization is still active)")
                     pipe.enable_sequential_cpu_offload()
             else:
                 print("[Cosmos3] Sequential CPU offload")
