@@ -93,13 +93,16 @@ class Cosmos3ModelLoader:
 
     def load(self, model, quantization="int8", custom_path=""):
         # ── import cosmos3 plugins ────────────────────────────────────────────
+        # transformers_cosmos3 is no longer required now that Cosmos3OmniPipeline
+        # comes from mainline diffusers (which uses plain transformers.AutoTokenizer,
+        # not this plugin) — see the Cosmos3OmniDiffusersPipeline import note below.
+        # Soft-import only: if a future dependency turns out to need it after all,
+        # this degrades to a visible downstream error rather than a hard crash here.
         try:
-            import transformers_cosmos3  # noqa: F401 — requires transformers>=4.57
+            import transformers_cosmos3  # noqa: F401
+            print("[Cosmos3] transformers_cosmos3 available (not required, but present)")
         except ImportError:
-            raise ImportError(
-                "[Cosmos3] transformers-cosmos3 not found. "
-                "Install: pip install 'transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3'"
-            )
+            pass
         try:
             from diffusers import Cosmos3OmniPipeline as Cosmos3OmniDiffusersPipeline
         except ImportError as _e:
@@ -153,8 +156,23 @@ class Cosmos3ModelLoader:
         if model == "custom":
             if not custom_path:
                 raise ValueError("[Cosmos3] custom_path must be set when model='custom'")
-            source = custom_path
-            print(f"[Cosmos3] Loading from custom path: {source}")
+            # If custom_path looks like an HF repo id (not an existing local dir) and a
+            # concept_mapping-staged copy already exists locally (same convention as the
+            # non-custom branch below: models/diffusion_models/<repo_basename>/), prefer
+            # that over re-resolving/downloading from the Hub. model_index.json presence
+            # is the marker that a full staged copy is there, not a partial/failed one.
+            if not os.path.isdir(custom_path):
+                _staged_name = custom_path.split("/")[-1]
+                _staged_dir = os.path.join(folder_paths.models_dir, "diffusion_models", _staged_name)
+                if os.path.isfile(os.path.join(_staged_dir, "model_index.json")):
+                    source = _staged_dir
+                    print(f"[Cosmos3] Loading from concept_mapping-staged copy: {source}")
+                else:
+                    source = custom_path
+                    print(f"[Cosmos3] Loading from custom path (no staged copy found, resolving via Hub): {source}")
+            else:
+                source = custom_path
+                print(f"[Cosmos3] Loading from custom path: {source}")
         else:
             model_name = model.split("/")[-1]   # "Cosmos3-Nano"
             model_dir = os.path.join(folder_paths.models_dir, "diffusion_models", model_name)
