@@ -101,43 +101,24 @@ class Cosmos3ModelLoader:
                 "Install: pip install 'transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3'"
             )
         try:
-            from diffusers_cosmos3 import Cosmos3OmniDiffusersPipeline
-            import diffusers_cosmos3 as _dc3_pkg
-        except ImportError:
+            from diffusers import Cosmos3OmniPipeline as Cosmos3OmniDiffusersPipeline
+        except ImportError as _e:
             raise ImportError(
-                "[Cosmos3] diffusers-cosmos3 not found. "
-                "Install: pip install 'diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3'"
-            )
+                "[Cosmos3] Cosmos3OmniPipeline not found in installed diffusers. "
+                "Cosmos3 support was merged into mainline diffusers "
+                "(src/diffusers/pipelines/cosmos/pipeline_cosmos3_omni.py) — there is no "
+                "separate 'diffusers-cosmos3' plugin package; that repo path never existed. "
+                "Install diffusers from git HEAD: "
+                "pip install git+https://github.com/huggingface/diffusers.git"
+            ) from _e
 
-        # ── sample_args patch ────────────────────────────────────────────────
-        # The sample_args/*.json files that Cosmos3OmniDiffusersPipeline reads at
-        # inference time may not be included in the pip install (packaging gap in
-        # cosmos-framework as of June 2026).  Create them with correct defaults
-        # from the README if they're missing.
-        _sample_args_dir = pathlib.Path(_dc3_pkg.__file__).parent / "sample_args"
-        _sample_args_dir.mkdir(exist_ok=True)
-        # Default negative derived from NVIDIA's canonical negative_prompt.json:
-        # covers the quality failure modes the model was trained to avoid.
-        _COSMOS3_DEFAULT_NEG = (
-            "blurry, low quality, jpeg artifacts, distorted features, unnatural proportions, "
-            "floating subjects, broken geometry, visible compression artifacts, muddy textures, "
-            "color bleeding, waxy skin, extra limbs, asymmetric face, teeth artifacts, "
-            "flat lighting, no shadows, inconsistent light sources, flickering, temporal artifacts, "
-            "shaky camera, rolling shutter, visible tiling, repeated textures, watermark, text, logo"
-        )
-        _mode_defaults = {
-            "text2video":  {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
-                            "negative_prompt": _COSMOS3_DEFAULT_NEG,
-                            "negative_prompt_keep_metadata": False},
-            "image2video": {"guidance": 6.0, "num_steps": 10, "shift": 10.0,
-                            "negative_prompt": _COSMOS3_DEFAULT_NEG,
-                            "negative_prompt_keep_metadata": False},
-        }
-        for _mode, _defs in _mode_defaults.items():
-            _p = _sample_args_dir / f"{_mode}.json"
-            # Always overwrite so persistent containers pick up step-count changes
-            _p.write_text(json.dumps(_defs, indent=2))
-            print(f"[Cosmos3] Wrote sample_args/{_mode}.json (num_steps={_defs['num_steps']})")
+        # ── sample_args patch: NO LONGER NEEDED ────────────────────────────────
+        # This used to write sample_args/*.json files because the old standalone
+        # diffusers-cosmos3 plugin read num_steps/guidance from disk instead of
+        # __call__ kwargs. Mainline diffusers' Cosmos3OmniPipeline takes
+        # num_inference_steps/guidance_scale directly as call arguments (see the
+        # inspect.signature-gated kwargs building in Cosmos3T2VSampler/T2ISampler
+        # below), so there's nothing to patch here anymore.
         # ─────────────────────────────────────────────────────────────────────
 
         # ── RoPE 'default' patch ──────────────────────────────────────────────
@@ -215,8 +196,8 @@ class Cosmos3ModelLoader:
             )
             _quant_applied = False
             try:
-                from torchao.quantization import quantize_, int8_weight_only, int4_weight_only
-                _qfn = int8_weight_only() if quantization == "int8" else int4_weight_only()
+                from torchao.quantization import quantize_, Int8WeightOnlyConfig, Int4WeightOnlyConfig
+                _qfn = Int8WeightOnlyConfig() if quantization == "int8" else Int4WeightOnlyConfig()
                 quantize_(pipe.transformer, _qfn)
                 _quant_applied = True
                 print(f"[Cosmos3] {quantization.upper()} applied — transformer ~"
@@ -261,32 +242,38 @@ class Cosmos3ModelLoader:
         # The pipeline then iterates over that string char-by-char and passes
         # characters as token IDs → ValueError in torch.tensor().
         # Wrap the method to guarantee list[int] output.
-        _orig_tc = pipe.tokenize_caption
+        # This patch targeted a bug in the old standalone diffusers-cosmos3 plugin;
+        # mainline diffusers' Cosmos3OmniPipeline is a different implementation and
+        # may not expose tokenize_caption at all, so this is best-effort.
+        try:
+            _orig_tc = pipe.tokenize_caption
 
-        def _safe_tokenize_caption(caption, is_video=False, use_system_prompt=False):
-            result = _orig_tc(caption, is_video=is_video, use_system_prompt=use_system_prompt)
+            def _safe_tokenize_caption(caption, is_video=False, use_system_prompt=False):
+                result = _orig_tc(caption, is_video=is_video, use_system_prompt=use_system_prompt)
 
-            # Newer transformers returns BatchEncoding instead of list[int].
-            # Iterating over BatchEncoding yields dict keys (strings), not token IDs.
-            if hasattr(result, "input_ids"):
-                ids = result.input_ids
-                if isinstance(ids, list) and ids and isinstance(ids[0], list):
-                    ids = ids[0]
-                elif hasattr(ids, "tolist"):
-                    ids = ids.squeeze().tolist()
-                result = ids
+                # Newer transformers returns BatchEncoding instead of list[int].
+                # Iterating over BatchEncoding yields dict keys (strings), not token IDs.
+                if hasattr(result, "input_ids"):
+                    ids = result.input_ids
+                    if isinstance(ids, list) and ids and isinstance(ids[0], list):
+                        ids = ids[0]
+                    elif hasattr(ids, "tolist"):
+                        ids = ids.squeeze().tolist()
+                    result = ids
 
-            if isinstance(result, str):
-                result = pipe.text_tokenizer.encode(result, add_special_tokens=False)
-            elif isinstance(result, list) and result and not isinstance(result[0], int):
-                flat = []
-                for item in result:
-                    (flat.extend(item) if isinstance(item, list) else flat.append(int(item)))
-                result = flat
+                if isinstance(result, str):
+                    result = pipe.text_tokenizer.encode(result, add_special_tokens=False)
+                elif isinstance(result, list) and result and not isinstance(result[0], int):
+                    flat = []
+                    for item in result:
+                        (flat.extend(item) if isinstance(item, list) else flat.append(int(item)))
+                    result = flat
 
-            return result
+                return result
 
-        pipe.tokenize_caption = _safe_tokenize_caption
+            pipe.tokenize_caption = _safe_tokenize_caption
+        except AttributeError:
+            print("[Cosmos3] pipeline has no tokenize_caption to patch — skipping (expected on mainline diffusers)")
 
         # ── pack_input_sequence intercept ──────────────────────────────────────
         # Second line of defence: inspect and fix input_text_indexes right before
