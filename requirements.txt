@@ -1,18 +1,29 @@
-# Cosmos3-Nano ComfyUI custom nodes
+# Cosmos3 ComfyUI custom nodes
 #
-# diffusers-cosmos3 is an NVIDIA plugin that patches diffusers at import time
-# to register Cosmos3OmniDiffusersPipeline and Cosmos3OmniTransformer.
-# It must be installed AND imported before DiffusionPipeline.from_pretrained.
+# Cosmos3 support lives in mainline diffusers (pipelines/cosmos/pipeline_cosmos3_omni.py,
+# class Cosmos3OmniPipeline) as of the diffusers git main branch — there is no separate
+# "diffusers-cosmos3" plugin package; that repo path never existed on NVIDIA's
+# cosmos-framework repo (only transformers-cosmos3 and vllm-cosmos3 do, and
+# transformers-cosmos3 isn't required either — Cosmos3OmniPipeline uses plain
+# transformers.AutoTokenizer, not that plugin).
 #
-# diffusers>=0.37.0 is required. Install from git HEAD if 0.37 is not on PyPI yet:
-#   pip install git+https://github.com/huggingface/diffusers.git
+# IMPORTANT: every entry below is a single unspaced token with no >, <, or @ characters.
+# Whatever installs this file (Graydient, ComfyUI-Manager) has been observed building an
+# UNQUOTED shell command from these lines — "name @ git+url" gets word-split on the
+# unquoted "@" into invalid separate arguments, and "name>=x,<y" gets parsed as shell
+# output/input redirection (">" and "<" are shell metacharacters, not part of the word).
+# Confirmed live 2026-09-30: both bugs silently broke installs with no visible pip error
+# in the accessible logs (the failures happen before log capture starts). Use exact `==`
+# pins or bare/unversioned names only — never `>=`, `<=`, version ranges, or `name @ url`.
 
-diffusers @ git+https://github.com/huggingface/diffusers.git
-diffusers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/diffusers-cosmos3
-transformers-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3
-accelerate>=0.27.0
-torchao
-transformers>=4.40.0
-huggingface_hub>=0.23.0
+git+https://github.com/huggingface/diffusers.git
+accelerate
+# Pinned: torchao>=0.16 removed int8_weight_only/int4_weight_only (functional API)
+# in favor of Int8WeightOnlyConfig/Int4WeightOnlyConfig (class-based). Code uses the
+# new API — keep torchao on a version that has it, and has Blackwell (sm_120) kernels.
+# 0.18.0 is confirmed working live (RTX 5090, RTX 4090).
+torchao==0.18.0
+transformers
+huggingface_hub
 sentencepiece
 av
