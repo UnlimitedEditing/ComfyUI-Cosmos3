@@ -699,8 +699,10 @@ class Cosmos3T2VSampler:
         )
         if pil_init is not None:
             kwargs["image"] = pil_init
-            # Anchor first frame to the input image; pipeline generates the rest
-            kwargs["condition_frame_indexes"] = [0]
+            # Cosmos3OmniPipeline anchors frame 0 to `image` automatically for I2V.
+            # condition_frame_indexes_vision is a real kwarg but only documented for
+            # the `video` (vid2vid) input path, which this node doesn't expose — no
+            # equivalent is needed/accepted for plain image conditioning.
         if negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
