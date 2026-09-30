@@ -644,9 +644,16 @@ class Cosmos3T2VSampler:
     and saves the full video as MP4 to the output directory.
 
     num_frames tips:
-      • Stick to 4k+1 values (5, 9, 17, 33, 65, 129, 189) for clean temporal compression.
+      • Stick to 4k+1 values (5, 9, 17, 33, 65, 129, 189, 257...) for clean temporal
+        compression.
       • Start with 33 frames (~1.4 s) to probe memory; scale up from there.
-      • 189 frames (full 8 s) will likely OOM on GPUs < 48 GB even with INT4.
+      • 189 was a leftover Nano-era OOM guess, not a real model/API ceiling — the
+        pipeline uses RoPE (computed from sequence shape), not a fixed position
+        table, so nothing in the code hard-stops at 189. NVIDIA's own docs list
+        different validated ranges per model tier (Edge: 50-150, Super-4Step: up
+        to 400) but those are "what we tested," not enforced maximums. Past that
+        range you're extrapolating RoPE beyond its trained distribution — quality
+        is unverified, not guaranteed to error.
     """
 
     @classmethod
@@ -655,8 +662,10 @@ class Cosmos3T2VSampler:
             "required": {
                 "pipeline":            ("COSMOS3_PIPELINE",),
                 "prompt":              ("STRING", {"multiline": True, "forceInput": True}),
-                "num_frames":          ("INT",   {"default": 33,  "min": 5,   "max": 189, "step": 4,
-                                                  "tooltip": "5/9/17/33/65/129/189 — use 4k+1 values"}),
+                "num_frames":          ("INT",   {"default": 33,  "min": 5,   "max": 4001, "step": 4,
+                                                  "tooltip": "4k+1 values only (5/9/17/33/65/129/189/257/...). "
+                                                             "No hard model ceiling — NVIDIA validated up to ~400 "
+                                                             "for Super-4Step; past that is untested territory."}),
                 "resolution":          (list(RESOLUTIONS.keys()), {"default": "1280x720 (16:9 HD)"}),
                 "fps":                 ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0}),
                 "num_inference_steps": ("INT",   {"default": 10,  "min": 1,   "max": 100, "step": 1}),
@@ -789,20 +798,236 @@ class Cosmos3T2VSampler:
         return (first_frame, video_path)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Cosmos3T2VChunkedSampler:
+    """
+    Long-form Cosmos3 T2V/I2V by chunked video-to-video continuation, run inside a
+    single node so it can loop until a wall-clock budget is hit (for one Graydient
+    job's ~380-400s timeout) rather than needing external multi-node/multi-job
+    chaining, which ComfyUI has no native loop primitive for anyway.
+
+    How continuation works (from diffusers' Cosmos3OmniPipeline.prepare_latents):
+    each chunk after the first passes the previous chunk's tail frames as `video`,
+    with condition_video_keep="first" (the supplied frames are treated as the START
+    of this chunk's window and kept clean) and condition_frame_indexes_vision=(0,1)
+    (the pipeline's own default — keeps the first `max(indices)*temporal_compression+1`
+    raw frames, i.e. 5 frames when the VAE's temporal_compression is 4). The model
+    then generates everything after those anchor frames for the rest of this chunk's
+    num_frames. The output always reproduces the anchor frames at the start, so they
+    are trimmed off before appending to the accumulated result (they'd otherwise
+    duplicate the tail already in the previous chunk's output).
+
+    Untested end-to-end as of first write — this is the first live test of chunked
+    continuation on Cosmos3. If chunk boundaries show visible discontinuity/drift,
+    that's a real finding about the technique, not necessarily a bug in this node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline":            ("COSMOS3_PIPELINE",),
+                "prompt":              ("STRING", {"multiline": True, "forceInput": True}),
+                "chunk_frames":        ("INT",   {"default": 33, "min": 5, "max": 189, "step": 4,
+                                                  "tooltip": "Frames generated per chunk (4k+1 values). "
+                                                             "Kept independent from the total-length ceiling — "
+                                                             "this is per-chunk VRAM/time cost, not total video length."}),
+                "max_total_frames":    ("INT",   {"default": 100000, "min": 9, "max": 1000000, "step": 1,
+                                                  "tooltip": "Hard safety ceiling on total accumulated frames. "
+                                                             "In practice max_seconds will almost always hit first."}),
+                "max_seconds":         ("FLOAT", {"default": 270.0, "min": 5.0, "max": 3600.0, "step": 5.0,
+                                                  "tooltip": "Wall-clock budget for the generation LOOP only — "
+                                                             "does not include pip install/ComfyUI startup, which "
+                                                             "eat into the same ~380-400s Graydient job timeout "
+                                                             "before this node even starts. Default leaves ~110s "
+                                                             "buffer for that platform overhead + MP4 encode/save."}),
+                "resolution":          (list(RESOLUTIONS.keys()), {"default": "854x480  (16:9 480p)"}),
+                "fps":                 ("FLOAT", {"default": 16.0, "min": 1.0, "max": 60.0, "step": 1.0}),
+                "num_inference_steps": ("INT",   {"default": 10,  "min": 1,   "max": 100, "step": 1}),
+                "guidance_scale":      ("FLOAT", {"default": 6.0, "min": 0.0, "max": 20.0, "step": 0.5}),
+                "seed":                ("INT",   {"default": 0,   "min": 0,   "max": 0xFFFFFFFFFFFFFFFF}),
+                "filename_prefix":     ("STRING", {"default": "cosmos3/t2v_long"}),
+            },
+            "optional": {
+                "init_image":      ("IMAGE",  {"tooltip": "Optional — anchors chunk 0 as I2V. Omit for pure T2V."}),
+                "negative_prompt": ("STRING", {"multiline": True, "forceInput": True}),
+                "custom_width":    ("INT",    {"default": 832, "min": 256, "max": 2048, "step": 16}),
+                "custom_height":   ("INT",    {"default": 480, "min": 256, "max": 2048, "step": 16}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("first_frame", "video_path", "total_frames", "elapsed_seconds")
+    FUNCTION = "generate"
+    CATEGORY = "Cosmos3"
+
+    def generate(
+        self,
+        pipeline,
+        prompt,
+        chunk_frames,
+        max_total_frames,
+        max_seconds,
+        resolution,
+        fps,
+        num_inference_steps,
+        guidance_scale,
+        seed,
+        filename_prefix="cosmos3/t2v_long",
+        init_image=None,
+        negative_prompt=None,
+        custom_width=832,
+        custom_height=480,
+    ):
+        import inspect
+        import time
+
+        if resolution == "custom":
+            w, h = custom_width, custom_height
+        else:
+            w, h = RESOLUTIONS[resolution]
+        w = (w // 16) * 16
+        h = (h // 16) * 16
+
+        # Latent-space conditioning window (pipeline's own default). Converted to a
+        # raw-frame count below via the VAE's actual temporal_compression, not a
+        # hardcoded 4 — different model tiers may differ.
+        _condition_indexes_vision = (0, 1)
+        try:
+            _temporal_compression = int(pipeline.vae.config.scale_factor_temporal)
+        except Exception:
+            _temporal_compression = 4  # fallback: Wan-family VAEs (used by Cosmos3) default
+        _overlap_frames = max(_condition_indexes_vision) * _temporal_compression + 1
+
+        sig = inspect.signature(pipeline.__call__)
+
+        pil_init = None
+        if init_image is not None:
+            _img_np = (init_image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            pil_init = Image.fromarray(_img_np, mode="RGB")
+
+        t_start = time.time()
+        all_new_frames = []   # list of Tensor[t, H, W, C] in [0,1], non-overlapping segments
+        prev_tail_pil = None  # list[PIL.Image] — tail of previous chunk, fed as `video`
+        chunk_idx = 0
+        total_frames = 0
+
+        while True:
+            elapsed = time.time() - t_start
+            if elapsed >= max_seconds:
+                print(f"[Cosmos3 Chunked] Stopping: max_seconds budget reached "
+                      f"({elapsed:.1f}s / {max_seconds:.0f}s) after {chunk_idx} chunk(s), "
+                      f"{total_frames} frames")
+                break
+            if total_frames >= max_total_frames:
+                print(f"[Cosmos3 Chunked] Stopping: max_total_frames reached "
+                      f"({total_frames} frames)")
+                break
+
+            kwargs = dict(
+                prompt=prompt,
+                width=w,
+                height=h,
+                num_frames=chunk_frames,
+                fps=float(fps),
+                generator=torch.Generator(device=mm.get_torch_device()).manual_seed(seed + chunk_idx),
+            )
+            if chunk_idx == 0:
+                if pil_init is not None:
+                    kwargs["image"] = pil_init
+            else:
+                kwargs["video"] = prev_tail_pil
+                kwargs["condition_frame_indexes_vision"] = _condition_indexes_vision
+                kwargs["condition_video_keep"] = "first"
+            if negative_prompt:
+                kwargs["negative_prompt"] = negative_prompt
+            if "num_inference_steps" in sig.parameters:
+                kwargs["num_inference_steps"] = num_inference_steps
+            if "guidance_scale" in sig.parameters:
+                kwargs["guidance_scale"] = guidance_scale
+            if "output_type" in sig.parameters:
+                kwargs["output_type"] = "pt"
+
+            print(f"[Cosmos3 Chunked] chunk {chunk_idx}: {w}×{h} | {chunk_frames} frames | "
+                  f"mode={'I2V-start' if (chunk_idx == 0 and pil_init is not None) else ('continuation' if chunk_idx else 'T2V-start')} | "
+                  f"elapsed={elapsed:.1f}s/{max_seconds:.0f}s")
+
+            result = pipeline(**kwargs)
+            frames_tchw = result[0].float().clamp(0.0, 1.0)   # [T, C, H, W]
+            frames_thwc = frames_tchw.permute(0, 2, 3, 1)      # [T, H, W, C]
+
+            if chunk_idx == 0:
+                new_segment = frames_thwc
+            else:
+                # First _overlap_frames reproduce the anchor we fed in — drop them,
+                # they'd duplicate the tail already appended from the previous chunk.
+                new_segment = frames_thwc[_overlap_frames:]
+                if new_segment.shape[0] == 0:
+                    print(f"[Cosmos3 Chunked] WARNING: chunk {chunk_idx} produced no new "
+                          f"frames beyond the overlap window (chunk_frames={chunk_frames} <= "
+                          f"overlap={_overlap_frames}) — stopping to avoid an infinite loop")
+                    break
+
+            all_new_frames.append(new_segment)
+            total_frames += new_segment.shape[0]
+
+            # Tail for the NEXT chunk's conditioning comes from this chunk's actual
+            # output (real generated pixels, not the input anchor).
+            _tail = frames_thwc[-_overlap_frames:]
+            prev_tail_pil = [
+                Image.fromarray((f.cpu().numpy() * 255).clip(0, 255).astype(np.uint8), mode="RGB")
+                for f in _tail
+            ]
+
+            chunk_idx += 1
+
+        elapsed_total = time.time() - t_start
+        full = torch.cat(all_new_frames, dim=0) if all_new_frames else torch.zeros(1, h, w, 3)
+        print(f"[Cosmos3 Chunked] Done: {chunk_idx} chunks, {full.shape[0]} total frames "
+              f"({full.shape[0] / fps:.1f}s of video @ {fps:.0f}fps), {elapsed_total:.1f}s elapsed")
+
+        # ── save MP4 ──────────────────────────────────────────────────────────
+        video_path = ""
+        try:
+            import imageio.v3 as iio
+            frames_np = (full.cpu().numpy() * 255).astype(np.uint8)
+
+            _safe = filename_prefix.strip("/\\")
+            _save_dir = os.path.join(
+                folder_paths.get_output_directory(),
+                os.path.dirname(_safe) or "cosmos3/t2v_long"
+            )
+            os.makedirs(_save_dir, exist_ok=True)
+            _base = os.path.basename(_safe) or "t2v_long"
+            _fname = f"{_base}_{seed}_{full.shape[0]}f.mp4"
+            video_path = os.path.join(_save_dir, _fname)
+
+            iio.imwrite(video_path, frames_np, fps=fps, codec="h264", quality=8)
+            print(f"[Cosmos3 Chunked] Saved {full.shape[0]} frames → {video_path}")
+        except Exception as _ve:
+            print(f"[Cosmos3 Chunked] Warning: MP4 save failed ({_ve})")
+
+        first_frame = full[0:1]  # [1, H, W, C]
+        return (first_frame, video_path, full.shape[0], elapsed_total)
+
+
 # ── registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
-    "Cosmos3ModelLoader":       Cosmos3ModelLoader,
-    "Cosmos3PromptEnricher":    Cosmos3PromptEnricher,
-    "Cosmos3T2ISampler":        Cosmos3T2ISampler,
-    "Cosmos3T2VSampler":        Cosmos3T2VSampler,
-    "Cosmos3LoadImageFromURL":  Cosmos3LoadImageFromURL,
+    "Cosmos3ModelLoader":        Cosmos3ModelLoader,
+    "Cosmos3PromptEnricher":     Cosmos3PromptEnricher,
+    "Cosmos3T2ISampler":         Cosmos3T2ISampler,
+    "Cosmos3T2VSampler":         Cosmos3T2VSampler,
+    "Cosmos3T2VChunkedSampler":  Cosmos3T2VChunkedSampler,
+    "Cosmos3LoadImageFromURL":   Cosmos3LoadImageFromURL,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Cosmos3ModelLoader":       "Cosmos3 Model Loader",
-    "Cosmos3PromptEnricher":    "Cosmos3 Prompt Enricher",
-    "Cosmos3T2ISampler":        "Cosmos3 T2I / I2I Sampler",
-    "Cosmos3T2VSampler":        "Cosmos3 T2V Sampler",
-    "Cosmos3LoadImageFromURL":  "Cosmos3 Load Image From URL",
+    "Cosmos3ModelLoader":        "Cosmos3 Model Loader",
+    "Cosmos3PromptEnricher":     "Cosmos3 Prompt Enricher",
+    "Cosmos3T2ISampler":         "Cosmos3 T2I / I2I Sampler",
+    "Cosmos3T2VSampler":         "Cosmos3 T2V Sampler",
+    "Cosmos3T2VChunkedSampler":  "Cosmos3 T2V Chunked (Long-Form) Sampler",
+    "Cosmos3LoadImageFromURL":   "Cosmos3 Load Image From URL",
 }
